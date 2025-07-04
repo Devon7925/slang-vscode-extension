@@ -3,7 +3,7 @@
     "displayName": "Slang",
     "description": "Extension for the Slang Shading Language",
     "publisher": "shader-slang",
-    "version": "1.9.12",
+    "version": "1.10.0",
     "icon": "./images/icon.png",
     "engines": {
         "vscode": "^1.85.0"
@@ -69,7 +69,7 @@
                 },
                 {
                     "command": "slang.playgroundRun",
-                    "when": "resourceLangId == slang",
+                    "when": "resourceLangId == slang && isPlaygroundFile == true",
                     "group": "navigation@2"
                 },
                 {

@@ -11,6 +11,11 @@ import { LanguageClient } from 'vscode-languageclient/browser';
 import type { CompileRequest, EntrypointsRequest, EntrypointsResult, PlaygroundMessage, Result, Shader } from '../../shared/playgroundInterface';
 import { checkShaderType, getResourceCommandsFromAttributes, getUniformControllers, getUniformSize, isControllerRendered, parseCallCommands } from "../../shared/util.js";
 
+// Maps to track open panels by file URI and command type
+const playgroundPanels = new Map<string, vscode.WebviewPanel>();
+const uniformPanels = new Map<string, vscode.WebviewPanel>();
+const outputPanels = new Map<string, vscode.OutputChannel>();
+
 const compileOptions = ['SPIRV', 'HLSL', 'GLSL', 'METAL', 'WGSL', 'CUDA'] as const;
 type LanguageOptions = {
 	languageId: string,
@@ -52,7 +57,7 @@ export async function getSlangFilesWithContents(): Promise<{ uri: string, conten
 	for (const uri of files) {
 		try {
 			const document = await vscode.workspace.openTextDocument(uri);
-			results.push({ uri: uri.toString(true), content: document.getText() });
+			results.push({ uri: uri.toString(false), content: document.getText() });
 		} catch (err) {
 			console.error(`Failed to read ${uri.fsPath}:`, err);
 		}
@@ -82,7 +87,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 				target: "WGSL",
 				entrypoint: shaderType,
 				sourceCode: userSource,
-				shaderPath: window.activeTextEditor.document.uri.toString(true),
+				shaderPath: window.activeTextEditor.document.uri.toString(false),
 				noWebGPU: false,
 			});
 			if (compileResult.succ == false) {
@@ -92,7 +97,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 			const compilation = compileResult.result;
 
 			let resourceCommandsResult = getResourceCommandsFromAttributes(compilation.reflection);
-			if(resourceCommandsResult.succ == false) {
+			if (resourceCommandsResult.succ == false) {
 				vscode.window.showErrorMessage("Error while parsing Resource commands: " + resourceCommandsResult.message);
 				return;
 			}
@@ -100,11 +105,18 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 			let uniformComponents = getUniformControllers(resourceCommandsResult.result)
 
 			let callCommandResult = parseCallCommands(compilation.reflection);
-			if(callCommandResult.succ == false) {
+			if (callCommandResult.succ == false) {
 				vscode.window.showErrorMessage("Error while parsing CALL commands: " + callCommandResult.message);
 				return;
 			}
 
+			// Key for this file/run
+			const playgroundKey = userURI.toString() + ':playground';
+			// Close previous panel if exists
+			if (playgroundPanels.has(playgroundKey)) {
+				try { playgroundPanels.get(playgroundKey)!.dispose(); } catch { }
+				playgroundPanels.delete(playgroundKey);
+			}
 			const panel = window.createWebviewPanel(
 				'slangPlayground',
 				'Slang Playground',
@@ -114,10 +126,18 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 					retainContextWhenHidden: true,
 				}
 			);
+			playgroundPanels.set(playgroundKey, panel);
+			panel.onDidDispose(() => playgroundPanels.delete(playgroundKey));
 			panel.webview.html = getWebviewContent(context, panel, 'client/dist/webviewBundle.js', 'client/dist/webviewBundle.css');
 
 			if (shaderType === 'printMain') {
+				const outputKey = userURI.toString() + ':output';
+				if (outputPanels.has(outputKey)) {
+					try { outputPanels.get(outputKey)!.dispose(); } catch { }
+					outputPanels.delete(outputKey);
+				}
 				const shaderOutputLog = vscode.window.createOutputChannel(`Slang Shader Output (${window.activeTextEditor.document.fileName})`);
+				outputPanels.set(outputKey, shaderOutputLog);
 				panel.webview.onDidReceiveMessage(message => {
 					if (message.type === 'log') {
 						shaderOutputLog.append(message.text);
@@ -126,6 +146,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 				});
 				panel.onDidDispose(() => {
 					shaderOutputLog.dispose();
+					outputPanels.delete(outputKey);
 				});
 			}
 
@@ -144,7 +165,12 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 			};
 			panel.webview.postMessage(message)
 
-			if(uniformComponents.some(isControllerRendered)) {
+			if (uniformComponents.some(isControllerRendered)) {
+				const uniformKey = userURI.toString() + ':uniform';
+				if (uniformPanels.has(uniformKey)) {
+					try { uniformPanels.get(uniformKey)!.dispose(); } catch { }
+					uniformPanels.delete(uniformKey);
+				}
 				const uniform_panel = window.createWebviewPanel(
 					'slangPlaygroundUniforms',
 					'Slang Playground Uniforms',
@@ -154,9 +180,10 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 						retainContextWhenHidden: true,
 					}
 				);
+				uniformPanels.set(uniformKey, uniform_panel);
+				uniform_panel.onDidDispose(() => uniformPanels.delete(uniformKey));
 				uniform_panel.webview.html = getWebviewContent(context, uniform_panel, "client/dist/uniformWebviewBundle.js", "client/dist/uniformWebviewBundle.css");
 				uniform_panel.webview.onDidReceiveMessage(uniform_message => {
-					console.log("uniform update:", uniform_message)
 					if (uniform_message.type === 'update') {
 						let playground_message: PlaygroundMessage = {
 							type: "uniformUpdate",
@@ -176,10 +203,28 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 					} catch {
 						// ignore if panel was already disposed
 					}
+					uniformPanels.delete(uniformKey);
 				})
 			}
 		})
 	);
+
+	vscode.window.onDidChangeActiveTextEditor(editor => {
+		updateContext(editor);
+	});
+
+	vscode.workspace.onDidChangeTextDocument(event => {
+		if (vscode.window.activeTextEditor?.document === event.document) {
+			updateContext(vscode.window.activeTextEditor);
+		}
+	});
+
+	function updateContext(editor: vscode.TextEditor | undefined) {
+		const text = editor?.document.getText() || "";
+		const shouldShow = text.match("void\\s+printMain\\s*\\(") != null || text.match("float4\\s+imageMain\\s*\\(") != null;
+		vscode.commands.executeCommand('setContext', 'isPlaygroundFile', shouldShow);
+	}
+
 	// Register a virtual document content provider for readonly docs
 	const slangVirtualScheme = 'slang-virtual';
 	const virtualDocumentContents = new Map();
@@ -206,7 +251,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 			// Send the picked option to the server and get the result
 			const parameter: EntrypointsRequest = {
 				sourceCode: userSource,
-				shaderPath: window.activeTextEditor.document.uri.toString(true),
+				shaderPath: window.activeTextEditor.document.uri.toString(false),
 			}
 			let entrypoints: EntrypointsResult = await slangHandler.entrypoints(parameter);
 			const entrypointSelection = await window.showQuickPick(entrypoints, {
@@ -222,7 +267,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 			target: targetSelection,
 			entrypoint: selectedEntrypoint,
 			sourceCode: userSource,
-			shaderPath: window.activeTextEditor.document.uri.toString(true),
+			shaderPath: window.activeTextEditor.document.uri.toString(false),
 			noWebGPU: true,
 		});
 		if (compilationResult.succ == false) {
@@ -235,7 +280,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 		const vdocUri = Uri.parse(`${slangVirtualScheme}:/${vDocName}`);
 		virtualDocumentContents.set(vDocName, shader.code);
 		const doc = await workspace.openTextDocument(vdocUri);
-		await window.showTextDocument(doc, { preview: false, viewColumn: window.activeTextEditor?.viewColumn }).then(editor => {
+		await window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside }).then(editor => {
 			vscode.languages.setTextDocumentLanguage(doc, compileOptionMap[targetSelection].languageId);
 		});
 	}));
@@ -247,7 +292,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 			target: "WGSL",
 			entrypoint: "",
 			sourceCode: userSource,
-			shaderPath: window.activeTextEditor.document.uri.toString(true),
+			shaderPath: window.activeTextEditor.document.uri.toString(false),
 			noWebGPU: true,
 		});
 		if (compilationResult.succ == false) {
@@ -260,7 +305,7 @@ export async function sharedActivate(context: ExtensionContext, slangHandler: Sl
 		const vdocUri = Uri.parse(`${slangVirtualScheme}:/${vDocName}`);
 		virtualDocumentContents.set(vDocName, JSON.stringify(shader.reflection, undefined, 4));
 		const doc = await workspace.openTextDocument(vdocUri);
-		await window.showTextDocument(doc, { preview: false, viewColumn: window.activeTextEditor?.viewColumn }).then(editor => {
+		await window.showTextDocument(doc, { preview: false, viewColumn: vscode.ViewColumn.Beside }).then(editor => {
 			vscode.languages.setTextDocumentLanguage(doc, "json");
 		});
 	}));
